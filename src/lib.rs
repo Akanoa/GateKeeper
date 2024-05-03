@@ -1,9 +1,6 @@
-use actix::{Actor, StreamHandler};
-use actix_web_actors::ws;
-use actix_web_actors::ws::WebsocketContext;
-use bytestring::ByteString;
+use actix_ws::Message;
 use eyre::{eyre, Context};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use states::State;
 use std::collections::HashMap;
@@ -11,7 +8,6 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use tokio::process::Child;
 use tokio::sync::Mutex;
-use tokio_tungstenite::tungstenite::Message;
 
 mod states;
 
@@ -195,15 +191,8 @@ pub async fn create_command(
 
 type Sender = tokio::sync::mpsc::UnboundedSender<bytes::Bytes>;
 pub type Aborter = Arc<Mutex<Option<Arc<tokio::sync::Notify>>>>;
-type Outgoing = Arc<
-    Mutex<
-        futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<tokio_native_tls::TlsStream<tokio::net::TcpStream>>,
-            Message,
-        >,
-    >,
->;
-type MaybeMessage = Option<Result<Message, tokio_tungstenite::tungstenite::Error>>;
+type Outgoing = Arc<Mutex<actix_ws::Session>>;
+type MaybeMessage = Option<Result<Message, actix_ws::ProtocolError>>;
 
 enum Command {
     Start,
@@ -211,8 +200,8 @@ enum Command {
     Other(String),
 }
 
-impl From<&String> for Command {
-    fn from(value: &String) -> Self {
+impl From<String> for Command {
+    fn from(value: String) -> Self {
         match value.as_str() {
             "start" => Command::Start,
             "quit" => Command::Quit,
@@ -240,7 +229,7 @@ async fn handle_message(
                 let mut message_str = None;
                 log::info!("New message {text}");
 
-                let command: Command = text.into();
+                let command: Command = text.to_string().into();
 
                 match command {
                     Command::Start => {
@@ -278,13 +267,9 @@ async fn handle_message(
 
                 if let Some(message_str) = message_str {
                     ws_sender
-                        .send(Message::Text(message_str))
+                        .text(message_str)
                         .await
                         .map_err(|err| eyre!("Unable to send message to stream : {err}"))?;
-                    ws_sender
-                        .flush()
-                        .await
-                        .map_err(|err| eyre!("Unable to flush stream : {err}"))?;
                 }
             }
             Message::Binary(data) => {
@@ -296,19 +281,18 @@ async fn handle_message(
                 state = state.attempt_to_stop_processus();
                 log::info!("Close connection");
             }
-            Message::Frame(_) => {}
+            Message::Continuation(_) => {}
+            Message::Nop => {}
         };
     }
     Ok(state)
 }
 
-async fn handle_connection(
-    stream: tokio_native_tls::TlsStream<tokio::net::TcpStream>,
+pub async fn logic(
+    mut stream: actix_ws::MessageStream,
+    session: actix_ws::Session,
 ) -> eyre::Result<()> {
-    let websocket = tokio_tungstenite::accept_async(stream).await?;
-
-    let (outgoing, mut incoming) = websocket.split();
-    let outgoing = Arc::new(Mutex::new(outgoing));
+    let outgoing = Arc::new(Mutex::new(session));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
     let failer = Arc::new(tokio::sync::Notify::new());
 
@@ -318,10 +302,9 @@ async fn handle_connection(
     loop {
         tokio::select! {
             data = rx.recv() => {
-                dbg!(&data);
                 if let Some(data) = data {
                     let mut writer = outgoing.lock().await;
-                    writer.send(Message::Binary(data.to_vec())).await?;
+                    writer.binary(data.to_vec()).await?
                 }
             }
             _ = failer.notified() => {
@@ -331,14 +314,15 @@ async fn handle_connection(
                 current_state.set(new_state)?;
 
                 let mut writer = outgoing.lock().await;
-                writer.send(Message::Text("Process failed".to_string())).await?;
+                writer.text("Process failed").await?;
 
             }
-            message = incoming.next() => {
+            message = stream.next() => {
+
+                log::info!("New message");
 
                 let state = current_state.take().ok_or(eyre!("Unable to get State"))?;
                 let new_state = handle_message(message, outgoing.clone(), tx.clone(), failer.clone(), state).await?;
-                //dbg!(&new_state);
 
                 if let State::EndConnection(_) = new_state {
                     break
@@ -351,41 +335,6 @@ async fn handle_connection(
     }
 
     log::info!("End connection");
-
-    Ok(())
-}
-
-async fn server() -> eyre::Result<()> {
-    let port = 9001;
-    let host = "127.0.0.1";
-
-    let pkcs12_bytes = include_bytes!("../assets/key.p12");
-    let identity = native_tls::Identity::from_pkcs12(pkcs12_bytes, "toto")?;
-
-    // create tls acceptor
-
-    let acceptor = tokio_native_tls::TlsAcceptor::from(native_tls::TlsAcceptor::new(identity)?);
-    let acceptor = Arc::new(acceptor);
-
-    let server = tokio::net::TcpListener::bind((host, port)).await?;
-    log::info!("Listening at {host}:{port}");
-
-    while let Ok((stream, _)) = server.accept().await {
-        log::info!("New connection from {:?}", stream.peer_addr());
-
-        let stream = match acceptor.accept(stream).await {
-            Ok(stream) => {
-                log::debug!("Accept TLS stream");
-                stream
-            }
-            Err(err) => {
-                log::error!("An error occurred while init TLS connection {:?}", err);
-                continue;
-            }
-        };
-
-        tokio::task::spawn(handle_connection(stream));
-    }
 
     Ok(())
 }

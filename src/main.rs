@@ -1,5 +1,5 @@
-use actix::Actor;
 use actix_web::{get, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use gatekeeper::logic;
 
 #[get("/")]
 async fn index() -> impl Responder {
@@ -7,8 +7,12 @@ async fn index() -> impl Responder {
 }
 
 #[get("/ws")]
-async fn ws(req: HttpRequest, stream: web::Payload) -> impl Responder {
-    HttpResponse::Ok().body("ws")
+async fn ws(req: HttpRequest, stream: web::Payload) -> Result<HttpResponse, actix_web::Error> {
+    let (response, session, msg_stream) = actix_ws::handle(&req, stream)?;
+
+    tokio::task::spawn_local(async move { logic(msg_stream, session).await });
+
+    Ok(response)
 }
 
 async fn http_server() -> eyre::Result<()> {
