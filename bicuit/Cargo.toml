@@ -1,0 +1,8 @@
+[package]
+name = "bicuit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+biscuit-auth = { workspace = true }
+eyre = { workspace = true }
