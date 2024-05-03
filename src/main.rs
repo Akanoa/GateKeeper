@@ -1,13 +1,16 @@
+use crate::states::{EndConnection, State};
+use crate::Command::Other;
 use eyre::{eyre, Context};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use tokio::process::Child;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
+
+mod states;
 
 #[derive(Deserialize, Debug, Clone)]
 struct CommandDetails {
@@ -52,15 +55,21 @@ fn get_command(token: &str) -> eyre::Result<CommandDetails> {
     Ok(command)
 }
 
-async fn format_process_exit_status(exit_status: tokio::io::Result<ExitStatus>, pid: &str) {
+async fn format_process_exit_status(
+    exit_status: tokio::io::Result<ExitStatus>,
+    pid: &str,
+    failer: Arc<tokio::sync::Notify>,
+) {
     match exit_status {
         Ok(status) => match status.code() {
             None => {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                failer.notify_one();
                 log::warn!("Child {pid} process was terminated by a system signal")
             }
             Some(code) => {
                 if !status.success() {
+                    failer.notify_one();
                     log::warn!("Child {pid} exited with status code {code}")
                 } else {
                     log::debug!("Child {pid} successfully terminated")
@@ -68,6 +77,7 @@ async fn format_process_exit_status(exit_status: tokio::io::Result<ExitStatus>, 
             }
         },
         Err(err) => {
+            failer.notify_one();
             log::warn!("Child process {pid} has exited with error : {err}")
         }
     }
@@ -118,9 +128,10 @@ async fn handle_process_termination(child: &mut Child) {
     }
 }
 
-async fn create_command(
+pub async fn create_command(
     token: &str,
     tx: tokio::sync::mpsc::UnboundedSender<bytes::Bytes>,
+    failer: Arc<tokio::sync::Notify>,
 ) -> eyre::Result<Arc<tokio::sync::Notify>> {
     let pty = pty_process::Pty::new()?;
     pty.resize(pty_process::Size::new(24, 80))?;
@@ -158,11 +169,13 @@ async fn create_command(
             tokio::select! {
                 data = reader.next() => {
                     if let Some(Ok(data)) = data {
-                        tx.send(data);
+                        if let Err(err) = tx.send(data) {
+                            log::warn!("Unable to send data from process to websocket {err}")
+                        }
                     }
                 },
                 exit_status = child.wait() => {
-                    format_process_exit_status(exit_status, &pid).await;
+                    format_process_exit_status(exit_status, &pid, failer).await;
                     break
                 },
                 _ = aborter_process.notified() => {
@@ -178,7 +191,7 @@ async fn create_command(
 }
 
 type Sender = tokio::sync::mpsc::UnboundedSender<bytes::Bytes>;
-type Aborter = Arc<Mutex<Option<Arc<tokio::sync::Notify>>>>;
+pub type Aborter = Arc<Mutex<Option<Arc<tokio::sync::Notify>>>>;
 type Outgoing = Arc<
     Mutex<
         futures_util::stream::SplitSink<
@@ -189,59 +202,71 @@ type Outgoing = Arc<
 >;
 type MaybeMessage = Option<Result<Message, tokio_tungstenite::tungstenite::Error>>;
 
+enum Command {
+    Start,
+    Quit,
+    Other(String),
+}
+
+impl From<&String> for Command {
+    fn from(value: &String) -> Self {
+        match value.as_str() {
+            "start" => Command::Start,
+            "quit" => Command::Quit,
+            x => Other(x.to_string()),
+        }
+    }
+}
+
 async fn handle_message(
     message: MaybeMessage,
     outgoing: Outgoing,
-    enter_token: Arc<Mutex<bool>>,
-    token: Arc<Mutex<Option<String>>>,
-    aborter: Aborter,
     tx: Sender,
-) -> eyre::Result<()> {
+    failer: Arc<tokio::sync::Notify>,
+    mut state: State,
+) -> eyre::Result<State> {
+    if message.is_none() {
+        return Ok(State::EndConnection(EndConnection));
+    }
+
     if let Some(Ok(message)) = message {
         let mut ws_sender = outgoing.lock().await;
 
         match &message {
             Message::Text(text) => {
+                let mut message_str = text.to_string();
                 log::info!("New message {text}");
 
-                let mut message_str = text.to_string();
-                let mut enter_token_lock = enter_token.lock().await;
-                let mut token_lock = token.lock().await;
-                let mut process_aborter_lock = aborter.lock().await;
+                let command: Command = text.into();
 
-                if *enter_token_lock {
-                    log::debug!("Define token");
-                    *token_lock = Some(text.to_string());
-                    *enter_token_lock = false;
+                match command {
+                    Command::Start => {
+                        state = state.start();
+                        message_str = "Enter token:".to_string()
+                    }
+                    Command::Quit => {
+                        state = state.attempt_to_stop_processus();
+                        message_str = "Process stopped".to_string()
+                    }
+                    Other(data) => {
+                        if let State::Authentication(_) = &state {
+                            let authentication_state = state
+                                .as_authentication_state()
+                                .ok_or(eyre!("Not a NoToken state"))?;
+                            authentication_state.set_token(&data);
+                            authentication_state.set_tx(tx.clone(), failer.clone());
+                            state = state.attempt_to_run_processus().await;
 
-                    if let Some(ref token_str) = *token_lock {
-                        if process_aborter_lock.is_none() {
-                            log::debug!("Creating command");
-                            let notifier = create_command(token_str, tx).await?;
-                            log::debug!("Starting process");
-                            *process_aborter_lock = Some(notifier);
-                            message_str = "Starting process".to_string();
-                            *token_lock = None;
+                            match state {
+                                State::Started(_) => message_str = "Process started".to_string(),
+                                State::Failed(_) => {
+                                    message_str = "Unable to start process".to_string()
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            message_str = data
                         }
-                    }
-                }
-
-                if text == "start" {
-                    if token_lock.is_none() {
-                        message_str = "Enter token: ".to_string();
-                        *enter_token_lock = true
-                    } else if process_aborter_lock.is_some() {
-                        message_str = "Already started process".to_string()
-                    }
-                }
-
-                if text == "quit" {
-                    if let Some(command_aborter) = process_aborter_lock.deref() {
-                        command_aborter.notify_one();
-                        message_str = "Stopping process".to_string();
-                        *process_aborter_lock = None
-                    } else {
-                        message_str = "Already destroyed process".to_string()
                     }
                 }
 
@@ -260,18 +285,13 @@ async fn handle_message(
             Message::Ping(_) => {}
             Message::Pong(_) => {}
             Message::Close(_) => {
-                let mut aborter_lock = aborter.lock().await;
-                if let Some(process_aborter) = aborter_lock.deref() {
-                    process_aborter.notify_one();
-                    *aborter_lock = None;
-                    log::debug!("Stopping process");
-                }
+                state = state.attempt_to_stop_processus();
                 log::info!("Close connection");
             }
             Message::Frame(_) => {}
         };
     }
-    Ok(())
+    Ok(state)
 }
 
 async fn handle_connection(
@@ -281,11 +301,11 @@ async fn handle_connection(
 
     let (outgoing, mut incoming) = websocket.split();
     let outgoing = Arc::new(Mutex::new(outgoing));
-    let aborter: Aborter = Default::default();
-
-    let token: Arc<Mutex<Option<String>>> = Default::default();
-    let enter_token = Arc::new(Mutex::new(false));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+    let failer = Arc::new(tokio::sync::Notify::new());
+
+    let mut current_state = tokio::sync::OnceCell::new();
+    current_state.set(State::default())?;
 
     loop {
         tokio::select! {
@@ -296,7 +316,29 @@ async fn handle_connection(
                     writer.send(Message::Binary(data.to_vec())).await?;
                 }
             }
-            message = incoming.next() => handle_message(message, outgoing.clone(), enter_token.clone(), token.clone(), aborter.clone(), tx.clone()).await?
+            _ = failer.notified() => {
+                log::warn!("Process exiting");
+                let state = current_state.take().ok_or(eyre!("Unable to get State"))?;
+                let new_state = state.attempt_to_stop_processus();
+                current_state.set(new_state)?;
+
+                let mut writer = outgoing.lock().await;
+                writer.send(Message::Text("Process failed".to_string())).await?;
+
+            }
+            message = incoming.next() => {
+
+                let state = current_state.take().ok_or(eyre!("Unable to get State"))?;
+                let new_state = handle_message(message, outgoing.clone(), tx.clone(), failer.clone(), state).await?;
+                dbg!(&new_state);
+
+                if let State::EndConnection(_) = new_state {
+                    break
+                }
+
+            current_state.set(new_state)?;
+
+            }
         }
     }
 
