@@ -1,6 +1,8 @@
 use crate::{create_command, Sender};
+use pty_process::OwnedWritePty;
 use std::fmt::Debug;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 
 #[derive(Default, Debug)]
 pub struct Init;
@@ -12,6 +14,7 @@ pub struct Authentication {
 #[derive(Default, Debug)]
 pub struct Started {
     aborter: Arc<tokio::sync::Notify>,
+    writer: Option<OwnedWritePty>,
 }
 #[derive(Default, Debug)]
 pub struct EndConnection;
@@ -28,6 +31,17 @@ impl Authentication {
     }
 }
 
+impl Started {
+    pub async fn write(&mut self, data: &[u8]) -> eyre::Result<()> {
+        if let Some(ref mut writer) = self.writer {
+            writer.write(data).await?;
+            writer.write(b"\r\n").await?;
+            writer.flush().await?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub enum State {
     Init(Init),
@@ -40,16 +54,6 @@ pub enum State {
 impl Default for State {
     fn default() -> Self {
         State::Init(Init)
-    }
-}
-
-impl State {
-    pub fn as_authentication_state(&mut self) -> Option<&mut Authentication> {
-        if let State::Authentication(authentication) = self {
-            Some(authentication)
-        } else {
-            None
-        }
     }
 }
 
@@ -70,8 +74,11 @@ impl State {
                         let process_run_attempt =
                             create_command(token, tx.clone(), failer.clone()).await;
 
-                        if let Ok(aborter) = process_run_attempt {
-                            return State::Started(Started { aborter });
+                        if let Ok((aborter, writer)) = process_run_attempt {
+                            return State::Started(Started {
+                                aborter,
+                                writer: Some(writer),
+                            });
                         }
                     }
                 }

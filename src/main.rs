@@ -132,7 +132,7 @@ pub async fn create_command(
     token: &str,
     tx: tokio::sync::mpsc::UnboundedSender<bytes::Bytes>,
     failer: Arc<tokio::sync::Notify>,
-) -> eyre::Result<Arc<tokio::sync::Notify>> {
+) -> eyre::Result<(Arc<tokio::sync::Notify>, pty_process::OwnedWritePty)> {
     let pty = pty_process::Pty::new()?;
     pty.resize(pty_process::Size::new(24, 80))?;
 
@@ -157,7 +157,7 @@ pub async fn create_command(
     // child.wait : child status
     // aborter.notified : aborter => client décide de couper la connection
 
-    let (outgoing, _inbound) = pty.into_split();
+    let (outgoing, inbound) = pty.into_split();
 
     let mut reader = tokio_util::io::ReaderStream::new(outgoing);
 
@@ -187,7 +187,7 @@ pub async fn create_command(
         }
     });
 
-    Ok(aborter)
+    Ok((aborter, inbound))
 }
 
 type Sender = tokio::sync::mpsc::UnboundedSender<bytes::Bytes>;
@@ -234,7 +234,7 @@ async fn handle_message(
 
         match &message {
             Message::Text(text) => {
-                let mut message_str = text.to_string();
+                let mut message_str = None;
                 log::info!("New message {text}");
 
                 let command: Command = text.into();
@@ -242,42 +242,47 @@ async fn handle_message(
                 match command {
                     Command::Start => {
                         state = state.start();
-                        message_str = "Enter token:".to_string()
+                        message_str = Some("Enter token:".to_string())
                     }
                     Command::Quit => {
                         state = state.attempt_to_stop_processus();
-                        message_str = "Process stopped".to_string()
+                        message_str = Some("Process stopped".to_string())
                     }
-                    Other(data) => {
-                        if let State::Authentication(_) = &state {
-                            let authentication_state = state
-                                .as_authentication_state()
-                                .ok_or(eyre!("Not a NoToken state"))?;
-                            authentication_state.set_token(&data);
-                            authentication_state.set_tx(tx.clone(), failer.clone());
+                    Other(data) => match &mut state {
+                        State::Authentication(authentication) => {
+                            authentication.set_token(&data);
+                            authentication.set_tx(tx.clone(), failer.clone());
                             state = state.attempt_to_run_processus().await;
 
                             match state {
-                                State::Started(_) => message_str = "Process started".to_string(),
+                                State::Started(_) => {
+                                    message_str = Some("Process started".to_string())
+                                }
                                 State::Failed(_) => {
-                                    message_str = "Unable to start process".to_string()
+                                    message_str = Some("Unable to start process".to_string())
                                 }
                                 _ => {}
                             }
-                        } else {
-                            message_str = data
                         }
-                    }
+                        State::Started(started) => {
+                            if let Err(err) = started.write(data.as_bytes()).await {
+                                log::error!("Unable to send data to PTY : {err}")
+                            }
+                        }
+                        _ => {}
+                    },
                 }
 
-                ws_sender
-                    .send(Message::Text(message_str))
-                    .await
-                    .map_err(|err| eyre!("Unable to send message to stream : {err}"))?;
-                ws_sender
-                    .flush()
-                    .await
-                    .map_err(|err| eyre!("Unable to flush stream : {err}"))?;
+                if let Some(message_str) = message_str {
+                    ws_sender
+                        .send(Message::Text(message_str))
+                        .await
+                        .map_err(|err| eyre!("Unable to send message to stream : {err}"))?;
+                    ws_sender
+                        .flush()
+                        .await
+                        .map_err(|err| eyre!("Unable to flush stream : {err}"))?;
+                }
             }
             Message::Binary(data) => {
                 log::info!("New binary {data:?}")
@@ -330,7 +335,7 @@ async fn handle_connection(
 
                 let state = current_state.take().ok_or(eyre!("Unable to get State"))?;
                 let new_state = handle_message(message, outgoing.clone(), tx.clone(), failer.clone(), state).await?;
-                dbg!(&new_state);
+                //dbg!(&new_state);
 
                 if let State::EndConnection(_) = new_state {
                     break
