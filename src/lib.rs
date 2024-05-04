@@ -4,6 +4,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use states::State;
 use std::collections::HashMap;
+use std::num::ParseIntError;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use tokio::process::Child;
@@ -198,14 +199,36 @@ enum Command {
     Start,
     Quit,
     Other(String),
+    Input(String),
+    Resize(u32, u32),
 }
 
-impl From<String> for Command {
-    fn from(value: String) -> Self {
+const DELIMITER: &str = ";";
+
+impl TryFrom<String> for Command {
+    type Error = ParseIntError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
         match value.as_str() {
-            "start" => Command::Start,
-            "quit" => Command::Quit,
-            x => Command::Other(x.to_string()),
+            "1;start" => Ok(Command::Start),
+            "1;quit" => Ok(Command::Quit),
+            input => {
+                let data = input.to_string();
+                let splitting: Vec<&str> = data.split(DELIMITER).collect();
+                match splitting.first() {
+                    Some(&"0") | Some(&"2") => {
+                        if let Some(value) = splitting.get(1..=2) {
+                            let width = value[0].parse::<u32>()?;
+                            let height = value[1].parse::<u32>()?;
+                            Ok(Command::Resize(width, height))
+                        } else {
+                            Ok(Command::Other(data))
+                        }
+                    }
+                    Some(&"1") => Ok(Command::Input(input[2..].to_string())),
+                    _ => Ok(Command::Other(data)),
+                }
+            }
         }
     }
 }
@@ -229,7 +252,7 @@ async fn handle_message(
                 let mut message_str = None;
                 log::info!("New message {text}");
 
-                let command: Command = text.to_string().into();
+                let command: Command = text.to_string().try_into()?;
 
                 match command {
                     Command::Start => {
@@ -240,29 +263,37 @@ async fn handle_message(
                         state = state.attempt_to_stop_processus();
                         message_str = Some("Process stopped".to_string())
                     }
-                    Command::Other(data) => match &mut state {
-                        State::Authentication(authentication) => {
-                            authentication.set_token(&data);
-                            authentication.set_tx(tx.clone(), failer.clone());
-                            state = state.attempt_to_run_processus().await;
+                    Command::Input(data) => {
+                        message_str = Some(data.to_string());
 
-                            match state {
-                                State::Started(_) => {
-                                    message_str = Some("Process started".to_string())
+                        match &mut state {
+                            State::Authentication(authentication) => {
+                                authentication.set_token(&data);
+                                authentication.set_tx(tx.clone(), failer.clone());
+                                state = state.attempt_to_run_processus().await;
+
+                                match state {
+                                    State::Started(_) => {
+                                        message_str = Some("Process started".to_string())
+                                    }
+                                    State::Failed(_) => {
+                                        message_str = Some("Unable to start process".to_string())
+                                    }
+                                    _ => {}
                                 }
-                                State::Failed(_) => {
-                                    message_str = Some("Unable to start process".to_string())
+                            }
+                            State::Started(started) => {
+                                message_str = None;
+
+                                if let Err(err) = started.write(data.as_bytes()).await {
+                                    log::error!("Unable to send data to PTY : {err}")
                                 }
-                                _ => {}
                             }
+                            _ => {}
                         }
-                        State::Started(started) => {
-                            if let Err(err) = started.write(data.as_bytes()).await {
-                                log::error!("Unable to send data to PTY : {err}")
-                            }
-                        }
-                        _ => {}
-                    },
+                    }
+                    Command::Other(data) => message_str = Some(data.to_string()),
+                    _ => {}
                 }
 
                 if let Some(message_str) = message_str {

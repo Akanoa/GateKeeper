@@ -35,7 +35,7 @@ impl Started {
     pub async fn write(&mut self, data: &[u8]) -> eyre::Result<()> {
         if let Some(ref mut writer) = self.writer {
             writer.write(data).await?;
-            writer.write(b"\r\n").await?;
+            // writer.write(b"\r\n").await?;
             writer.flush().await?;
         }
         Ok(())
